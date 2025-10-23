@@ -5,6 +5,7 @@ import ffmpeg
 import numpy as np
 from loguru import logger
 from tqdm import tqdm
+import gc
 
 from sorawm.utils.video_utils import VideoLoader
 from sorawm.watermark_cleaner import WaterMarkCleaner
@@ -21,6 +22,8 @@ class SoraWM:
         input_video_path: Path,
         output_video_path: Path,
         progress_callback: Callable[[int], None] | None = None,
+        gc_interval: int = 30,
+        max_reuse_misses: int = 60,
     ):
         input_video_loader = VideoLoader(input_video_path)
         output_video_path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,43 +60,32 @@ class SoraWM:
             .run_async(pipe_stdin=True)
         )
 
-        frame_and_mask = {}
-        detect_missed = []
-
+        # 流式/小批处理：不缓存全量帧，边读边检测、修复、写出
         logger.debug(
             f"total frames: {total_frames}, fps: {fps}, width: {width}, height: {height}"
         )
+        last_bbox = None
+        misses_in_row = 0
+        batch_count = 0
+
         for idx, frame in enumerate(
-            tqdm(input_video_loader, total=total_frames, desc="Detect watermarks")
+            tqdm(input_video_loader, total=total_frames, desc="Process video")
         ):
-            detection_result = self.detector.detect(frame)
-            if detection_result["detected"]:
-                frame_and_mask[idx] = {"frame": frame, "bbox": detection_result["bbox"]}
+            # 检测当前帧水印
+            det = self.detector.detect(frame)
+            if det["detected"]:
+                bbox = det["bbox"]
+                last_bbox = bbox
+                misses_in_row = 0
             else:
-                frame_and_mask[idx] = {"frame": frame, "bbox": None}
-                detect_missed.append(idx)
+                # 未检测到时复用上一帧 bbox，最多连续复用 max_reuse_misses 帧
+                if last_bbox is not None and misses_in_row < max_reuse_misses:
+                    bbox = last_bbox
+                    misses_in_row += 1
+                else:
+                    bbox = None
 
-            # 10% - 50%
-            if progress_callback and idx % 10 == 0:
-                progress = 10 + int((idx / total_frames) * 40)
-                progress_callback(progress)
-
-        logger.debug(f"detect missed frames: {detect_missed}")
-
-        for missed_idx in detect_missed:
-            before = max(missed_idx - 1, 0)
-            after = min(missed_idx + 1, total_frames - 1)
-            before_box = frame_and_mask[before]["bbox"]
-            after_box = frame_and_mask[after]["bbox"]
-            if before_box:
-                frame_and_mask[missed_idx]["bbox"] = before_box
-            elif after_box:
-                frame_and_mask[missed_idx]["bbox"] = after_box
-
-        for idx in tqdm(range(total_frames), desc="Remove watermarks"):
-            frame_info = frame_and_mask[idx]
-            frame = frame_info["frame"]
-            bbox = frame_info["bbox"]
+            # 清理/直通
             if bbox is not None:
                 x1, y1, x2, y2 = bbox
                 mask = np.zeros((height, width), dtype=np.uint8)
@@ -101,12 +93,23 @@ class SoraWM:
                 cleaned_frame = self.cleaner.clean(frame, mask)
             else:
                 cleaned_frame = frame
-            process_out.stdin.write(cleaned_frame.tobytes())
 
-            # 50% - 95%
+            process_out.stdin.write(cleaned_frame.tobytes())
+            # 释放本轮临时变量引用
+            if bbox is not None:
+                del mask
+            del cleaned_frame
+            del frame
+
+            # 进度：10% - 95% 随处理推进
             if progress_callback and idx % 10 == 0:
-                progress = 50 + int((idx / total_frames) * 45)
-                progress_callback(progress)
+                progress = 10 + int((idx / max(1, total_frames)) * 85)
+                progress_callback(min(progress, 95))
+
+            # 小批量/垃圾回收
+            batch_count += 1
+            if batch_count % max(1, gc_interval) == 0:
+                gc.collect()
 
         process_out.stdin.close()
         process_out.wait()
@@ -119,6 +122,8 @@ class SoraWM:
 
         if progress_callback:
             progress_callback(99)
+        # 最终强制回收
+        gc.collect()
 
     def merge_audio_track(
         self, input_video_path: Path, temp_output_path: Path, output_video_path: Path
